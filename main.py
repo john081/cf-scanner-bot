@@ -1,5 +1,6 @@
 import socket
 import urllib.request
+import urllib.error
 import ipaddress
 import time
 import random
@@ -23,18 +24,526 @@ from flask import Flask, request, abort
 import telebot
 from telebot import types
 
-# ==================== CLOUDFLARE IP RANGES (December 2025) ====================
-CF_RANGES = [
-    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
-    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
-    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
-    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:8100::/32",
-    "2405:b500::/32", "2a06:98c0::/29", "2c0f:f248::/32"
+# ==================== TOR & PROXY SETUP (TOR IS DEFAULT) ====================
+USE_TOR = os.getenv('USE_TOR', 'true').lower() == 'true'  # TOR enabled by default
+
+if USE_TOR:
+    PROXIES = {
+        'http': 'socks5h://127.0.0.1:9050',
+        'https': 'socks5h://127.0.0.1:9050'
+    }
+    print("TOR mode ENABLED by default - all requests routed through TOR")
+    print("   (To run direct: USE_TOR=false)")
+else:
+    PROXIES = None
+    print("Direct mode (no proxy)")
+
+def build_opener():
+    if PROXIES:
+        proxy_handler = urllib.request.ProxyHandler(PROXIES)
+        opener = urllib.request.build_opener(proxy_handler)
+        return opener
+    return urllib.request
+
+opener = build_opener()
+
+# Random delay for stealth
+def random_delay(min_sec=1.5, max_sec=4.5):
+    time.sleep(random.uniform(min_sec, max_sec))
+
+# ==================== AUTO-UPDATE CLOUDFLARE IP RANGES ====================
+cf_networks = []
+
+def update_cf_ranges():
+    global cf_networks
+    ranges = []
+    try:
+        resp = opener.urlopen("https://www.cloudflare.com/ips-v4", timeout=20)
+        ranges.extend(resp.read().decode().strip().splitlines())
+        resp = opener.urlopen("https://www.cloudflare.com/ips-v6", timeout=20)
+        ranges.extend(resp.read().decode().strip().splitlines())
+        cf_networks = [ipaddress.ip_network(net.strip()) for net in ranges if net.strip()]
+        print(f"Cloudflare ranges updated automatically ({len(cf_networks)} ranges)")
+    except Exception:
+        print("Failed to update CF ranges - using fallback")
+        fallback = [
+            "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+            "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+            "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+            "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+            "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:8100::/32",
+            "2405:b500::/32", "2a06:98c0::/29", "2c0f:f248::/32"
+        ]
+        cf_networks = [ipaddress.ip_network(net) for net in fallback]
+
+update_cf_ranges()
+
+def is_cloudflare_ip(ip_str):
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return any(ip in net for net in cf_networks)
+    except:
+        return False
+
+# ==================== USER AGENTS & AUTO BYPASS HEADERS ====================
+BYPASS_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
 ]
 
-cf_networks = [ipaddress.ip_network(net) for net in CF_RANGES]
+AUTO_BYPASS_HEADERS = {
+    "X-Forwarded-For": "127.0.0.1",
+    "X-Real-IP": "127.0.0.1",
+    "X-Originating-IP": "127.0.0.1",
+    "X-Remote-IP": "127.0.0.1",
+    "X-Client-IP": "127.0.0.1",
+    "CF-Connecting-IP": "127.0.0.1",
+    "True-Client-IP": "127.0.0.1",
+    "X-Cluster-Client-IP": "127.0.0.1",
+    "Forwarded": "for=127.0.0.1",
+    "X-ProxyUser-Ip": "127.0.0.1",
+    "Client-IP": "127.0.0.1",
+    "X-Cache-Key": "debug123",
+    "Bypass-Tunnel": "origin-direct",
+    "Origin-Bypass": "true"
+}
 
+# ==================== CORE FUNCTIONS ====================
+def detect_web_server_from_headers(headers):
+    server = headers.get('Server', '').strip()
+    if server: return server
+    powered = headers.get('X-Powered-By', '')
+    if powered: return powered
+    via = headers.get('Via', '')
+    if via: return f"Proxy/Via: {via}"
+    return None
+
+def raw_server_banner(ip, port=443, use_ssl=True):
+    random_delay()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(12)
+        if use_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=ip)
+        s.connect((ip, port))
+        request = f"GET / HTTP/1.1\r\nHost: {ip}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+        s.sendall(request.encode())
+        response = b""
+        while True:
+            data = s.recv(8192)
+            if not data: break
+            response += data
+            if len(response) > 100 * 1024: break
+        s.close()
+
+        if not response: return None
+        header_part = response.split(b"\r\n\r\n")[0].decode('utf-8', errors='ignore')
+        headers = {}
+        lines = header_part.splitlines()
+        for line in lines[1:]:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip()] = v.strip()
+        return detect_web_server_from_headers(headers)
+    except:
+        return None
+
+def fingerprint_server(ip):
+    banner = raw_server_banner(ip, 443, True)
+    if banner: return banner
+    banner = raw_server_banner(ip, 80, False)
+    if banner: return banner
+    return "Unknown / Header Stripped"
+
+def fetch_page(host):
+    random_delay()
+    status_code = None
+    title = "No response"
+    headers = {}
+    is_rate_limited = False
+    rate_limit_reason = ""
+    bypassed_403 = False
+    detected_server = None
+    timeout = 18 if USE_TOR else 12
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    for scheme in ["https", "http"]:
+        try:
+            req = urllib.request.Request(f"{scheme}://{host}", headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; Mobile)"})
+            with opener.urlopen(req, timeout=timeout, context=ctx) as resp:
+                status_code = resp.code
+                headers = dict(resp.headers)
+                detected_server = detect_web_server_from_headers(headers)
+                data = resp.read(150 * 1024).decode('utf-8', errors='ignore')
+                m = re.search(r'<title>(.*?)</title>', data, re.I | re.S)
+                if m: title = m.group(1).strip()[:150]
+                break
+        except urllib.error.HTTPError as e:
+            status_code = e.code
+            headers = dict(getattr(e, 'headers', {}))
+            detected_server = detect_web_server_from_headers(headers)
+            title = "Access Denied / Blocked"
+        except:
+            continue
+
+    if status_code in [403, 401, 429, 503]:
+        random.shuffle(BYPASS_USER_AGENTS)
+        for ua in BYPASS_USER_AGENTS[:10]:
+            random_delay()
+            for scheme in ["https", "http"]:
+                try:
+                    extra_headers = {
+                        "User-Agent": ua,
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Connection": "keep-alive"
+                    }
+                    req = urllib.request.Request(f"{scheme}://{host}", headers=extra_headers)
+                    with opener.urlopen(req, timeout=timeout, context=ctx) as resp:
+                        if resp.code == 200:
+                            status_code = 200
+                            headers = dict(resp.headers)
+                            detected_server = detect_web_server_from_headers(headers)
+                            data = resp.read(150 * 1024).decode('utf-8', errors='ignore')
+                            m = re.search(r'<title>(.*?)</title>', data, re.I | re.S)
+                            if m: title = m.group(1).strip()[:150]
+                            bypassed_403 = True
+                            break
+                except:
+                    continue
+            if bypassed_403: break
+
+    if any(k in title.lower() for k in ["attention required", "checking your browser", "captcha", "ray id", "just a moment"]):
+        is_rate_limited = True
+        rate_limit_reason = "Cloudflare Challenge"
+
+    return {
+        "status": status_code,
+        "title": title,
+        "headers": headers,
+        "limited": is_rate_limited,
+        "reason": rate_limit_reason,
+        "bypassed_403": bypassed_403,
+        "server": detected_server
+    }
+
+def test_raw_get_root(ip, is_https=False):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(10)
+        if is_https:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=ip)
+            s.connect((ip, 443))
+        else:
+            s.connect((ip, 80))
+        request = f"GET / HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n"
+        s.sendall(request.encode())
+        response = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk: break
+            response += chunk
+        s.close()
+        if response:
+            head = response.split(b"\r\n\r\n")[0].decode(errors='ignore')
+            if "200" in head.splitlines()[0] or "301" in head.splitlines()[0] or "302" in head.splitlines()[0]:
+                return True
+        return False
+    except:
+        return False
+
+def test_websocket_exact(ip):
+    for scheme in ["wss", "ws"]:
+        url = f"{scheme}://{ip}/"
+        try:
+            ws = websocket.WebSocket()
+            ws.settimeout(10)
+            ws.connect(url, custom_header=[("Host", ip), ("Connection", "Upgrade"), ("Upgrade", "websocket")])
+            ws.close()
+            return True, scheme.upper()
+        except:
+            continue
+    return False, None
+
+def scan_ports(ip):
+    ports = [21, 22, 80, 443, 8080, 8443, 2222, 3389, 3306, 5432, 25, 587]
+    open_ports = []
+    def try_port(p):
+        try:
+            s = socket.socket()
+            s.settimeout(1.2)
+            if s.connect_ex((ip, p)) == 0:
+                open_ports.append(p)
+            s.close()
+        except:
+            pass
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        ex.map(try_port, ports)
+    return sorted(open_ports)
+
+def resolve_host(host):
+    try:
+        return socket.gethostbyname(host)
+    except:
+        return None
+
+def check_mx(domain):
+    if not HAS_DNS: return []
+    try:
+        answers = dns.resolver.resolve(domain, 'MX')
+        leaks = []
+        for rdata in answers:
+            mail = str(rdata.exchange).rstrip('.')
+            ip = resolve_host(mail)
+            if ip:
+                leaks.append((mail, ip))
+        return leaks
+    except:
+        return []
+
+SUBDOMAIN_WORDLIST = [
+    "direct","direct-connect","origin","mail","webmail","smtp","pop","pop3","imap","ftp","cpanel","whm","webdisk",
+    "admin","portal","dev","staging","test","beta","api","app","mobile","status","dashboard","login","secure",
+    "vpn","remote","ssh","bastion","db","mysql","panel","server","node","backup","ns1","ns2","autoconfig",
+    "autodiscover","mx","owa","exchange","intranet","git","jenkins","docker","k8s","monitor","grafana",
+    "prometheus","kibana","elasticsearch","redis","rabbitmq","sentry","www","cdn","assets","static","media"
+]
+
+def extract_base_domain(domain):
+    parts = domain.strip().lower().split('.')
+    if len(parts) >= 2:
+        return '.'.join(parts[-2:])
+    return domain
+
+def is_tunnel_safe(ip, page_info):
+    if not is_cloudflare_ip(ip):
+        return False, "Direct exposure - not proxied! 🚨"
+    
+    if page_info["status"] == 200:
+        if page_info.get("bypassed_403"):
+            return True, "403 bypassed with real browser UA → SAFE TO TUNNEL! ⚡"
+        return True, "200 OK + Proxied → SAFE TO TUNNEL ✅"
+    
+    if page_info["limited"]:
+        return False, f"Cloudflare block: {page_info['reason']}"
+    
+    if page_info["status"] in [403, 401, 404, 502, 503, 429] or page_info["status"] is None:
+        if test_raw_get_root(ip, is_https=True):
+            return True, "Blocked but raw HTTPS GET / works → SAFE VIA TUNNEL! ⚡"
+        if test_raw_get_root(ip, is_https=False):
+            return True, "Blocked but raw HTTP GET / works → SAFE VIA TUNNEL! ⚡"
+        ws_ok, proto = test_websocket_exact(ip)
+        if ws_ok:
+            return True, f"Blocked but {proto} WebSocket works → SAFE! ⚡"
+        return False, "All bypass attempts failed → NOT SAFE"
+    
+    return False, f"HTTP {page_info['status']} → NOT SAFE"
+
+# ==================== CUSTOM HEADER PAYLOAD TEST ====================
+def test_custom_headers_on_origin(ip, custom_headers, port=443, use_ssl=True):
+    if not custom_headers:
+        return None, None
+
+    random_delay()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(12)
+        if use_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=ip)
+        s.connect((ip, port))
+
+        header_lines = [f"{k}: {v}" for k, v in custom_headers.items()]
+        request = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {ip}\r\n"
+            f"User-Agent: Mozilla/5.0\r\n"
+            f"Connection: close\r\n" +
+            "\r\n".join(header_lines) + "\r\n\r\n"
+        )
+        s.sendall(request.encode())
+
+        response = b""
+        while True:
+            data = s.recv(8192)
+            if not data: break
+            response += data
+            if len(response) > 200 * 1024: break
+        s.close()
+
+        if not response:
+            return None, "No response"
+
+        full_resp = response.decode('utf-8', errors='ignore')
+        headers_part = full_resp.split('\r\n\r\n')[0]
+        body = full_resp.split('\r\n\r\n', 1)[1] if '\r\n\r\n' in full_resp else ""
+
+        reflected_headers = []
+        lower_headers = {k.lower(): v for k, v in re.findall(r'^(\S+): (.+)$', headers_part, re.M)}
+        for k, v in custom_headers.items():
+            if lower_headers.get(k.lower()) == v:
+                reflected_headers.append(f"{k}: {v}")
+
+        leaked_in_body = [f"{k}: {v}" for k, v in custom_headers.items() if v in body]
+
+        result = []
+        if reflected_headers:
+            result.append(f"REFLECTED in response headers: {', '.join(reflected_headers)}")
+        if leaked_in_body:
+            result.append(f"LEAKED in response body: {', '.join(leaked_in_body)}")
+
+        status_line = headers_part.splitlines()[0] if headers_part.splitlines() else ""
+
+        if result:
+            return "\n".join(result), status_line
+        else:
+            return "No leak/reflection detected", status_line
+
+    except Exception:
+        return None, "Connection failed"
+
+# ==================== ANALYZE HOST (WITH AUTO PAYLOAD ON 200 OK) ====================
+print_lock = threading.Lock()
+
+def analyze_host(host, potential_origin_ips):
+    with print_lock:
+        print(f"\n{'='*30} ANALYZING: {host.upper()} {'='*30}")
+    
+    ip = resolve_host(host)
+    if not ip:
+        with print_lock:
+            print("  No DNS resolution")
+        return
+    
+    cf_status = "PROXIED" if is_cloudflare_ip(ip) else "DIRECT (LEAK! 🚨)"
+    with print_lock:
+        print(f"  IP → {ip} | {cf_status}")
+    
+    if not is_cloudflare_ip(ip):
+        potential_origin_ips.add(ip)
+
+    page = fetch_page(host)
+    status_text = f"{page['status'] or 'No response'}"
+    if page['status'] == 200:
+        status_text = f"{status_text} (OK!)"
+        if page.get("bypassed_403"):
+            status_text += " (via UA bypass)"
+
+    server = page.get("server")
+    if not server and page["status"] in [200, 301, 302, 403]:
+        server = fingerprint_server(ip)
+
+    server_display = server or "Not detected"
+
+    with print_lock:
+        print(f"  Status → {status_text}")
+        print(f"  Title  → {page['title']}")
+        print(f"  Web Server → {server_display}")
+        print(f"  CF Block → {'YES' if page['limited'] else 'NO'}")
+
+    ports = scan_ports(ip)
+    if ports:
+        with print_lock:
+            print(f"  Open Ports → {ports}")
+
+    safe, reason = is_tunnel_safe(ip, page)
+    color = "" if safe else ""
+    symbol = "YES - SAFE TO TUNNEL!" if safe else "NO"
+    with print_lock:
+        print(f"  Tunnel Safe? → {symbol}")
+        print(f"      └─ {reason}")
+
+    # AUTO BYPASS HEADER TEST ON DIRECT 200 OK
+    if not is_cloudflare_ip(ip) and page['status'] == 200:
+        with print_lock:
+            print(f"\nDIRECT 200 OK → AUTO-TESTING BYPASS HEADERS")
+            print(f"    Sending {len(AUTO_BYPASS_HEADERS)} headers...")
+        triggered = False
+        for port, ssl in [(443, True), (80, False)]:
+            result, status = test_custom_headers_on_origin(ip, AUTO_BYPASS_HEADERS, port, ssl)
+            if result and "No leak" not in result:
+                proto = "HTTPS" if ssl else "HTTP"
+                with print_lock:
+                    print(f"   [{proto}:{port}] {status}")
+                    print(f"   → {result}")
+                    print(f"   DIRECT ORIGIN CONFIRMED VIA HEADER LEAK!")
+                triggered = True
+                break
+        if not triggered:
+            with print_lock:
+                print("   → No header reflection/leak (still direct 200 OK)")
+
+# ==================== SCAN LOGIC ====================
+def run_scan(chat_id, targets):
+    output_buffer = StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = output_buffer
+
+    all_origin_leaks = set()
+
+    for target in targets:
+        print("\n" + "█"*100)
+        print(f"TARGET: {target.upper()}")
+        print("█"*100)
+        
+        try:
+            ipaddress.ip_address(target)
+            print(f"  Direct IP → Cloudflare? {'YES' if is_cloudflare_ip(target) else 'NO → LEAK! 🚨'}")
+            ports = scan_ports(target)
+            print(f"  Open ports: {ports or 'None'}")
+            if not is_cloudflare_ip(target):
+                all_origin_leaks.add(target)
+            page = fetch_page(target)
+            safe, reason = is_tunnel_safe(target, page)
+            print(f"  Tunnel Safe? {'YES' if safe else 'NO'} → {reason}")
+            continue
+        except:
+            pass
+        
+        base = extract_base_domain(target)
+        hosts_to_check = [target]
+        local_leaks = set()
+
+        if HAS_DNS:
+            for mail, ip in check_mx(base):
+                tag = " (LEAK! 🚨)" if not is_cloudflare_ip(ip) else ""
+                print(f"    → {mail} → {ip}{tag}")
+                if not is_cloudflare_ip(ip):
+                    local_leaks.add(ip)
+                    all_origin_leaks.add(ip)
+                hosts_to_check.append(mail)
+
+        print("\nStarting deep subdomain brute-force...")
+        found = []
+        def check(sub):
+            full = f"{sub}.{base}"
+            if full == target: return
+            ip = resolve_host(full)
+            if ip:
+                found.append(full)
+                tag = " (LEAK! 🚨)" if not is_cloudflare_ip(ip) else " (proxied)"
+                print(f"    {full} → {ip}{tag}")
+                if not is_cloudflare_ip(ip):
+                    local_leaks.add(ip)
+                    all_origin_leaks.add(ip)
+        with ThreadPoolExecutor(max_workers=50) as ex:
+            ex.map(chec
 def is_cloudflare_ip(ip_str):
     try:
         ip = ipaddress.ip_address(ip_str)
