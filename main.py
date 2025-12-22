@@ -23,7 +23,7 @@ from flask import Flask, request, abort
 import telebot
 from telebot import types
 
-# ==================== CLOUDFLARE IP RANGES (December 2025) ====================
+# ==================== CLOUDFLARE IP RANGES ====================
 CF_RANGES = [
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
     "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
@@ -35,6 +35,114 @@ CF_RANGES = [
 
 cf_networks = [ipaddress.ip_network(net) for net in CF_RANGES]
 
+# ==================== YOUR FUNCTIONS (unchanged) ====================
+# (All your original functions: is_cloudflare_ip, fetch_page, analyze_host, etc.)
+# Paste them exactly as before — I'm skipping them here for brevity, but keep them all!
+
+# ... [all the functions from previous code: is_cloudflare_ip to analyze_host] ...
+
+# ==================== PRIVATE ACCESS CONTROL ====================
+app = Flask(__name__)
+
+TOKEN = os.getenv('BOT_TOKEN')
+bot = telebot.TeleBot(TOKEN)
+
+# <<< PUT YOUR AND FRIENDS' USER IDs HERE >>>
+ALLOWED_USERS = []  # Example: [756348188]
+
+def is_allowed(user_id):
+    return user_id in ALLOWED_USERS
+
+# ==================== SCAN LOGIC (same as before) ====================
+# run_scan function unchanged — deep_brute = True
+
+def run_scan(chat_id, targets):
+    # ... (same as previous version)
+
+# ==================== MESSAGE HANDLERS WITH ACCESS CHECK ====================
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    if not is_allowed(message.from_user.id):
+        bot.reply_to(message, "❌ Access denied. This bot is private.")
+        return
+    bot.reply_to(message, "🔍 <b>Cloudflare Leak & Tunnel Safety Scanner</b>\n\n"
+                          "Send a domain or IP to scan.\n"
+                          "Or upload a .txt file with targets (one per line).\n\n"
+                          "Deep subdomain brute is now <b>ENABLED</b> (scans take longer but find more leaks).", parse_mode='HTML')
+
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    if not is_allowed(message.from_user.id):
+        bot.reply_to(message, "❌ Access denied.")
+        return
+    # ... (same document handling)
+
+@bot.message_handler(func=lambda m: True)
+def handle_text(message):
+    if not is_allowed(message.from_user.id):
+        bot.reply_to(message, "❌ Access denied.")
+        return
+    # ... (same text handling)
+
+# ==================== WEBHOOK ====================
+@app.route('/' + TOKEN, methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_json(force=True)
+        update = types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return ''
+    abort(403)
+
+@app.route('/')
+def index():
+    return "Private CF Scanner Bot"
+
+if __name__ == '__main__':
+    bot.remove_webhook()
+    bot.polling()
+else:
+    bot.remove_webhook()
+    time.sleep(1)
+    service_url = f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com"
+    webhook_url = f"{service_url}/{TOKEN}"
+    bot.set_webhook(url=webhook_url)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+@bot.message_handler(func=lambda m: True)
+def handle_text(message):
+    if not is_allowed(message.from_user.id):
+        bot.reply_to(message, "❌ Access denied.")
+        return
+    # ... (same text handling)
+
+# ==================== WEBHOOK ====================
+@app.route('/' + TOKEN, methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_json(force=True)
+        update = types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return ''
+    abort(403)
+
+@app.route('/')
+def index():
+    return "Private CF Scanner Bot"
+
+if __name__ == '__main__':
+    bot.remove_webhook()
+    bot.polling()
+else:
+    bot.remove_webhook()
+    time.sleep(1)
+    service_url = f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com"
+    webhook_url = f"{service_url}/{TOKEN}"
+    bot.set_webhook(url=webhook_url)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))    time.sleep(1)
+    service_url = f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com"
+    webhook_url = f"{service_url}/{TOKEN}"
+    bot.set_webhook(url=webhook_url)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
 def is_cloudflare_ip(ip_str):
     try:
         ip = ipaddress.ip_address(ip_str)
