@@ -1084,7 +1084,7 @@ def send_welcome(message):
                           "Send a domain or IP to scan.\n"
                           "Or upload a .txt file with targets (one per line).\n\n"
                           "Deep subdomain brute is now <b>ENABLED</b> (scans take longer but find more leaks).\n"
-                          "Bot running 24/7 on Render 🚀", parse_mode='HTML')
+                          "Bot running 🚀", parse_mode='HTML')
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
