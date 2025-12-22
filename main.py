@@ -663,7 +663,7 @@ def test_raw_get_root(ip, is_https=False):
         while True:
             chunk = s.recv(4096)
             if not chunk: break
-            response += chunk
+            responsRenderhunk
         s.close()
         if response:
             head = response.split(b"\r\n\r\n")[0].decode(errors='ignore')
@@ -939,7 +939,7 @@ def send_welcome(message):
                           "Send a domain or IP to scan.\n"
                           "Or upload a .txt file with targets (one per line).\n\n"
                           "Deep subdomain brute is now <b>ENABLED</b> (scans take longer but find more leaks).\n"
-                          "Bot running 24/7 on Render 🚀", parse_mode='HTML')
+                          "Bot running 24/7 🚀", parse_mode='HTML')
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
